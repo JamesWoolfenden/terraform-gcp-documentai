@@ -1,0 +1,63 @@
+{
+  "scan_date": "2026-08-07T00:00:00Z",
+  "scan_path": ".",
+  "findings": [
+    {
+      "id": "HOLDEN_AI_001",
+      "status": "fixed",
+      "first_seen": "2026-08-07",
+      "last_seen": "2026-08-07",
+      "suppression_reason": null,
+      "principle": "key-management",
+      "severity": "HIGH",
+      "confidence": "high",
+      "title": "Document AI service agent is never granted access to the CMEK key it's configured to use",
+      "file": "google_document_ai_processor.tf",
+      "line": 5,
+      "resource": "google_document_ai_processor.main",
+      "related_resources": [
+        "example/examplea/google_kms_crypto_key.tf:google_kms_crypto_key.docai",
+        "example/examplea/module.documentai.tf:module.documentai"
+      ],
+      "explanation": "google_document_ai_processor.main now sets kms_key_name (correctly, per provider 7.31.0 docs), and the example wires in a real key via google_kms_crypto_key.docai. But per Google's own Document AI CMEK documentation, the Document AI Service Agent (service-<PROJECT_NUMBER>@gcp-sa-prod-dai-core.iam.gserviceaccount.com) must separately hold roles/cloudkms.cryptoKeyEncrypterDecrypter on that key before CMEK will work — Terraform never grants this automatically, and no google_kms_crypto_key_iam_member/binding exists anywhere in this repo. HLD_GCP_242 (CMEK required) and HLD_GCP_107 (referenced key must have rotation enabled) both pass because they only check attributes on the two resources in isolation; neither can see that the *access grant* linking them is missing. Without it, `terraform apply` on the example fails at processor-creation time with a permission-denied error. This is the exact same gap the workspace's own terraform-gcp-filestore module encodes as a custom policy (HLD_GCP_474) and terraform-gcp-pubsub already fixes with a dedicated google_kms_crypto_key_iam_member + google_project_service_identity pair — this module is the outlier that's missing it.",
+      "remediation": "Add two files to the module root, mirroring terraform-gcp-pubsub's google_project_service_identity.pubsub.tf / google_kms_crypto_key_iam_member.pubsub_service_agent.tf pattern:\n\n# google_project_service_identity.documentai.tf\nresource \"google_project_service_identity\" \"documentai\" {\n  provider = google-beta\n  service  = \"documentai.googleapis.com\"\n}\n\n# google_kms_crypto_key_iam_member.documentai_service_agent.tf\nresource \"google_kms_crypto_key_iam_member\" \"documentai_service_agent\" {\n  crypto_key_id = var.kms_key_name\n  role          = \"roles/cloudkms.cryptoKeyEncrypterDecrypter\"\n  member        = \"serviceAccount:${google_project_service_identity.documentai.email}\"\n}\n\nAlso add a google-beta entry to example/examplea/terraform.tf's required_providers block (matching pubsub's example), since the module now references provider = google-beta.",
+      "fixable": true,
+      "fix": "Create google_project_service_identity.documentai.tf:\nresource \"google_project_service_identity\" \"documentai\" {\n  provider = google-beta\n  service  = \"documentai.googleapis.com\"\n}\n\nCreate google_kms_crypto_key_iam_member.documentai_service_agent.tf:\nresource \"google_kms_crypto_key_iam_member\" \"documentai_service_agent\" {\n  crypto_key_id = var.kms_key_name\n  role          = \"roles/cloudkms.cryptoKeyEncrypterDecrypter\"\n  member        = \"serviceAccount:${google_project_service_identity.documentai.email}\"\n}\n\nEdit example/examplea/terraform.tf required_providers block to add:\n    google-beta = {\n      source  = \"hashicorp/google-beta\"\n      version = \"7.31.0\"\n    }"
+    },
+    {
+      "id": "HOLDEN_AI_002",
+      "status": "fixed",
+      "first_seen": "2026-08-07",
+      "last_seen": "2026-08-07",
+      "suppression_reason": null,
+      "principle": "key-management",
+      "severity": "HIGH",
+      "confidence": "high",
+      "title": "CMEK key ring is located in the \"eu\" multi-region, but Document AI requires the key in \"europe-west4\" for eu-multi-region processors",
+      "file": "example/examplea/google_kms_key_ring.tf",
+      "line": 2,
+      "resource": "google_kms_key_ring.docai",
+      "related_resources": [
+        "example/examplea/google_kms_crypto_key.tf:google_kms_crypto_key.docai",
+        "example/examplea/module.documentai.tf:module.documentai (location = \"eu\")"
+      ],
+      "explanation": "The example sets both the processor's location and the KMS key ring's location to \"eu\" on the assumption they must match. Google's Document AI CMEK documentation states the location of the key must match the processor's location *except* for the \"us\" and \"eu\" multi-regions, where the key must instead be in \"us-central1\" and \"europe-west4\" respectively — \"eu\" is not a valid Cloud KMS location for a key backing an eu-multi-region Document AI processor's CMEK. No deterministic rule can catch this: it requires knowing Document AI's specific location-mapping exception, not a generic same-location comparison. As configured, applying the example would create the key fine (eu is a valid KMS multi-region) but Document AI would reject the CMEK linkage at processor-creation time.",
+      "remediation": "Change example/examplea/google_kms_key_ring.tf location from \"eu\" to \"europe-west4\" (google_kms_crypto_key.docai inherits location from the key ring, so only the key ring needs updating). Leave var.location = \"eu\" on the processor/module itself unchanged — only the key's location is wrong.",
+      "fixable": true,
+      "fix": "In example/examplea/google_kms_key_ring.tf, change:\n  location = \"eu\"\nto:\n  location = \"europe-west4\""
+    }
+  ],
+  "suggested_policies": [
+    {
+      "rationale": "Setting kms_key_name on google_document_ai_processor does not by itself grant the Document AI service agent permission to use the key — GCP requires a separate IAM grant (roles/cloudkms.cryptoKeyEncrypterDecrypter to the service agent) that Terraform never creates automatically. This is structurally identical to the workspace's own HLD_GCP_474 (filestore) policy, just for a different resource type; coverage_by_type.google_document_ai_processor only lists HLD_GCP_242 (CMEK required), nothing checks the access grant. The condition is a plain requires_companion linked via kms_key_name -> crypto_key_id, so it fits the existing DSL with no extension.",
+      "yaml": "id: HLD_PROPOSED_001\nname: Document AI processors using CMEK must grant the Document AI service agent key access\nprinciple: key-management\nseverity: HIGH\nrationale: |\n  Setting kms_key_name on a google_document_ai_processor does not by itself\n  grant Document AI's service agent permission to use the key. GCP requires\n  the Document AI Service Agent\n  (service-<PROJECT_NUMBER>@gcp-sa-prod-dai-core.iam.gserviceaccount.com) to\n  hold roles/cloudkms.cryptoKeyEncrypterDecrypter on the referenced key, via\n  a separate IAM binding that Terraform never creates automatically. Without\n  it, processor creation fails at apply time with a permission-denied error.\nremediation: |\n  Grant the Document AI service agent access to the key:\n\n    resource \"google_project_service_identity\" \"documentai\" {\n      provider = google-beta\n      service  = \"documentai.googleapis.com\"\n    }\n\n    resource \"google_kms_crypto_key_iam_member\" \"documentai\" {\n      crypto_key_id = google_kms_crypto_key.main.id\n      role          = \"roles/cloudkms.cryptoKeyEncrypterDecrypter\"\n      member        = \"serviceAccount:${google_project_service_identity.documentai.email}\"\n    }\nresources:\n  google_document_ai_processor:\n    filter:\n      path: kms_key_name\n      not_null: true\n    any:\n      - requires_companion:\n          type: google_kms_crypto_key_iam_member\n          linked_via:\n            from: kms_key_name\n            to: crypto_key_id\n          where:\n            path: role\n            equals: roles/cloudkms.cryptoKeyEncrypterDecrypter\n      - requires_companion:\n          type: google_kms_crypto_key_iam_binding\n          linked_via:\n            from: kms_key_name\n            to: crypto_key_id\n          where:\n            path: role\n            equals: roles/cloudkms.cryptoKeyEncrypterDecrypter\n"
+    },
+    {
+      "rationale": "Document AI enforces an undocumented-to-Terraform location-matching rule between a CMEK key and its processor: locations must match exactly, except the 'us' and 'eu' multi-regions, which require the key in 'us-central1' / 'europe-west4' specifically. This is broadly applicable to any google_document_ai_processor + google_kms_crypto_key pairing, not just this repo, but the current DSL's linked_resource/requires_companion primitives only support direct attribute equality between linked resources — they can't express 'equal, except when source is one of these special values, in which case it must equal this other specific value instead'.",
+      "yaml": "id: HLD_PROPOSED_002\nname: Document AI CMEK key location must match processor location (with us/eu multi-region exceptions)\nprinciple: key-management\nseverity: HIGH\nrationale: |\n  The location of a Document AI processor's CMEK key must match the\n  processor's location, except for the 'us' and 'eu' multi-regions, where\n  the key must instead be located in 'us-central1' and 'europe-west4'\n  respectively. A key in the wrong location causes the CMEK linkage to be\n  rejected at processor-creation time even though both resources apply\n  independently without error.\nremediation: |\n  Set the KMS key ring's location to match the processor's location, using\n  'us-central1' if the processor location is 'us', 'europe-west4' if it is\n  'eu', or the same value otherwise.\nresources:\n  google_document_ai_processor:\n    filter:\n      path: kms_key_name\n      not_null: true\n    any:\n      - linked_resource:\n          type: google_kms_crypto_key\n          via: kms_key_name\n          to: id\n          must:\n            path: location\n            location_equivalent_map:\n              source_path: location\n              mapping:\n                us: us-central1\n                eu: europe-west4\n              default: match_source\n",
+      "requires_dsl_extension": true,
+      "dsl_extension_note": "Needs a new cross-resource comparison operator (working name: location_equivalent_map) usable inside a linked_resource.must block. Semantics: read the source resource's attribute at source_path (here, google_document_ai_processor.location); if its value is a key in mapping, the target attribute (google_kms_crypto_key.location) must equal the mapped value; otherwise (default: match_source) the target attribute must equal the source value exactly. This generalizes beyond Document AI to any GCP service with multi-region-to-specific-region CMEK key mapping quirks (several Google services follow the same us/eu multi-region convention)."
+    }
+  ],
+  "suggested_suppressions": []
+}

@@ -1,4 +1,5 @@
 # holden:ignore:HLD_TF_026 — examples intentionally use ../../ to reference the local module root
+# holden:ignore:HLD_TF_065: for expansion
 module "documentai" {
   source       = "../../"
   location     = "eu"
